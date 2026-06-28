@@ -87,6 +87,10 @@ from vllm.model_executor.models.interfaces import (
     supports_transcription,
     supports_xdrope,
 )
+from vllm.tzkv import (
+    approve_descriptor as tzkv_approve_descriptor,
+    verify_descriptor_use as tzkv_verify_descriptor_use,
+)
 from vllm.model_executor.models.interfaces_base import (
     VllmModelForPooling,
     is_pooling_model,
@@ -4090,6 +4094,7 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        tzkv_descriptor_approval = None
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4279,6 +4284,9 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            tzkv_descriptor_approval = tzkv_approve_descriptor(
+                slot_mappings_by_group, attn_metadata
+            )
 
             (
                 input_ids,
@@ -4311,6 +4319,9 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        tzkv_verify_descriptor_use(
+            tzkv_descriptor_approval, slot_mappings_by_group, attn_metadata
+        )
         with (
             set_forward_context(
                 attn_metadata,

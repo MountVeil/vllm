@@ -7,6 +7,10 @@ import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.tzkv import (
+    commit_block_table as tzkv_commit_block_table,
+    verify_block_table as tzkv_verify_block_table,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
@@ -144,6 +148,7 @@ class BlockTable:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        tzkv_verify_block_table(self, self.block_table.np, num_reqs)
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
@@ -165,6 +170,7 @@ class BlockTable:
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
+        tzkv_commit_block_table(self, self.block_table.np, num_reqs)
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
