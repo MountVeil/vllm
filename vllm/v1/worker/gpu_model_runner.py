@@ -1689,6 +1689,25 @@ class GPUModelRunner(
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        # TZKV: cache the real GPU slot mapping for KV payload attack hooks.
+        # This is the per-token KV-cache slot vector used by attention metadata.
+        self.tzkv_last_slot_mappings = slot_mapping_gid_0
+        self.tzkv_last_block_table_tensor = block_table_gid_0
+        # TZKV_BT_TENSOR_READY_CALL_BEGIN
+        try:
+            tzkv_bt_hook = getattr(self, "tzkv_block_table_attack_hook", None)
+            if tzkv_bt_hook is not None and getattr(tzkv_bt_hook, "enabled", False):
+                if hasattr(tzkv_bt_hook, "after_block_table_tensor_ready"):
+                    tzkv_bt_hook.after_block_table_tensor_ready(
+                        runner=self,
+                        scheduler_output=None,
+                        block_table_tensor=block_table_gid_0,
+                        slot_mapping=slot_mapping_gid_0,
+                        num_tokens=int(num_tokens),
+                    )
+        except Exception as e:
+            logger.exception("TZKV BT tensor-ready attack hook failed: %r", e)
+        # TZKV_BT_TENSOR_READY_CALL_END
         if self.model_config.enable_return_routed_experts:
             self.slot_mapping = slot_mapping_gid_0[:num_tokens].cpu().numpy()
         cm_base = CommonAttentionMetadata(
@@ -3362,17 +3381,33 @@ class GPUModelRunner(
             )
             # TZKV_KV_ATTACK_CALL_BEGIN
             tzkv_kv_hook = getattr(self, "tzkv_kv_payload_attack_hook", None)
-            if (tzkv_kv_hook is not None and
-                    getattr(tzkv_kv_hook, "enabled", False) and
-                    "scheduler_output" in locals() and
-                    "slot_mappings" in locals()):
+            if tzkv_kv_hook is not None and getattr(tzkv_kv_hook, "enabled", False):
                 try:
-                    tzkv_kv_hook.after_model_forward(
-                        runner=self,
-                        scheduler_output=scheduler_output,
-                        slot_mappings=slot_mappings,
-                        num_tokens=int(locals().get("num_tokens_unpadded", 0)),
-                    )
+                    tzkv_slot_mappings = locals().get("slot_mappings", None)
+                    if tzkv_slot_mappings is None:
+                        tzkv_slot_mappings = locals().get("slot_mapping", None)
+                    if tzkv_slot_mappings is None:
+                        tzkv_slot_mappings = getattr(self, "tzkv_last_slot_mappings", None)
+                    if tzkv_slot_mappings is None:
+                        tzkv_slot_mappings = getattr(self, "slot_mapping", None)
+                    if tzkv_slot_mappings is None:
+                        from vllm.v1.worker.tzkv_log_utils import write_event
+                        write_event("kv_attack_call_skip_no_slot_mapping_var", {
+                            "local_keys": sorted([str(k) for k in locals().keys() if "slot" in str(k).lower() or "sched" in str(k).lower() or "token" in str(k).lower()]),
+                            "has_scheduler_output": "scheduler_output" in locals(),
+                        })
+                    elif "scheduler_output" not in locals():
+                        from vllm.v1.worker.tzkv_log_utils import write_event
+                        write_event("kv_attack_call_skip_no_scheduler_output", {
+                            "slot_mapping_type": type(tzkv_slot_mappings).__name__,
+                        })
+                    else:
+                        tzkv_kv_hook.after_model_forward(
+                            runner=self,
+                            scheduler_output=scheduler_output,
+                            slot_mappings=tzkv_slot_mappings,
+                            num_tokens=int(locals().get("num_tokens_unpadded", locals().get("num_tokens", 0))),
+                        )
                 except Exception as e:
                     logger.exception("TZKV KV payload attack hook failed: %r", e)
             # TZKV_KV_ATTACK_CALL_END
