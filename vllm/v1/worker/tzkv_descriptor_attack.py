@@ -1,316 +1,178 @@
 # SPDX-License-Identifier: Apache-2.0
-#
-# TZKV minimal descriptor tamper hook for vLLM v0.14.
-#
-# This attack does NOT copy KV payload tensors.
-# This attack does NOT modify CPU-side input_batch.block_table.
-# This attack does NOT directly modify the original GPU block-table buffer.
-#
-# It corrupts a descriptor-private clone of CommonAttentionMetadata.block_table_tensor
-# after CommonAttentionMetadata is constructed and before builder.build() /
-# builder.update_block_table() consumes it.
+# TZKV research hook: descriptor / attention-metadata tamper.
 
 from __future__ import annotations
 
-import json
-import os
-import time
 from typing import Any
-
 import torch
-from vllm.v1.worker.tzkv_log_utils import tzkv_log_enabled
+
+from vllm.v1.worker.tzkv_log_utils import env_bool, env_int, write_event
 
 
-def _flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
-
-
-class TZKVDescriptorAttackHook:
+class TZKVDescriptorAttack:
     def __init__(self) -> None:
-        self.enabled = _flag("TZKV_DESCRIPTOR_ATTACK_ENABLE", "0")
-        self.log_path = os.getenv(
-            "TZKV_LOG",
-            "/home/xx/tee-llm-thor/logs/descriptor_attack_vllm014.log.jsonl",
-        )
+        self.enabled = env_bool("TZKV_DESC_ATTACK_ENABLE", "0")
+        self.max_blocks = env_int("TZKV_DESC_ATTACK_MAX_BLOCKS", 256)
+        self.source_order = env_int("TZKV_DESC_ATTACK_SOURCE_ORDER", 0)
+        self.victim_order = env_int("TZKV_DESC_ATTACK_VICTIM_ORDER", 1)
+        self.attack_once = env_bool("TZKV_DESC_ATTACK_ONCE", "1")
 
-        self.max_blocks = int(os.getenv("TZKV_DESCRIPTOR_ATTACK_MAX_BLOCKS", "16"))
-        self.min_prefill = int(os.getenv("TZKV_DESCRIPTOR_ATTACK_MIN_PREFILL", "8"))
+        self._req_order: list[str] = []
+        self._req_role: dict[str, str] = {}
+        self._source_row: torch.Tensor | None = None
+        self._tampered_count = 0
 
-        # Default continuous descriptor tamper.
-        # The attention metadata descriptor is rebuilt/refreshed every step.
-        self.once = _flag("TZKV_DESCRIPTOR_ATTACK_ONCE", "0")
+        if self.enabled:
+            write_event("desc_attack_hook_init", {
+                "max_blocks": self.max_blocks,
+                "source_order": self.source_order,
+                "victim_order": self.victim_order,
+                "attack_once": self.attack_once,
+            })
 
-        self.role_by_key: dict[str, str] = {}
-        self.source_key: str | None = None
-        self.victim_key: str | None = None
-
-        # source descriptor snapshot per kv_cache_gid
-        self.source_desc_gpu: dict[int, torch.Tensor] = {}
-        self.source_desc_cpu: dict[int, list[int]] = {}
-
-        self.tamper_count = 0
-
-        self._log("descriptor_hook_init", {
-            "enabled": self.enabled,
-            "max_blocks": self.max_blocks,
-            "min_prefill": self.min_prefill,
-            "once": self.once,
-        })
-
-    def _log(self, event: str, data: dict[str, Any] | None = None) -> None:
-        if not tzkv_log_enabled():
-            return
-        if not self.enabled:
-            return
-
-        rec: dict[str, Any] = {
-            "ts": time.time(),
-            "pid": os.getpid(),
-            "event": event,
-        }
-        if data:
-            rec.update(data)
-
+    @staticmethod
+    def _req_ids(runner: Any) -> list[str]:
         try:
-            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            return [str(x) for x in list(getattr(runner.input_batch, "req_ids", []) or [])]
         except Exception:
-            pass
+            return []
 
-    def _get_req_key(self, runner: Any, req_idx: int) -> str:
-        ib = getattr(runner, "input_batch", None)
+    def _assign_roles(self, runner: Any) -> None:
+        for req_id in self._req_ids(runner):
+            if req_id in self._req_role:
+                continue
 
-        for name in ("req_ids", "request_ids"):
-            xs = getattr(ib, name, None)
-            if isinstance(xs, (list, tuple)) and 0 <= req_idx < len(xs):
-                v = xs[req_idx]
-                if v is not None:
-                    return str(v)
+            order = len(self._req_order)
+            self._req_order.append(req_id)
 
-        m = getattr(ib, "req_id_to_index", None)
-        if isinstance(m, dict):
-            for rid, idx in m.items():
+            role = "other"
+            if order == self.source_order:
+                role = "source"
+            elif order == self.victim_order:
+                role = "victim"
+
+            self._req_role[req_id] = role
+            write_event("desc_request_role_assigned", {
+                "req_id": req_id,
+                "order": order,
+                "role": role,
+                "active_req_ids": self._req_ids(runner),
+            })
+
+    @staticmethod
+    def _metadata_bt_tensor(common_attn_metadata: Any) -> torch.Tensor | None:
+        for name in ("block_table_tensor", "block_tables", "block_table"):
+            x = getattr(common_attn_metadata, name, None)
+            if isinstance(x, torch.Tensor):
+                return x
+        return None
+
+    @staticmethod
+    def _set_metadata_bt_tensor(common_attn_metadata: Any, x: torch.Tensor) -> bool:
+        for name in ("block_table_tensor", "block_tables", "block_table"):
+            if hasattr(common_attn_metadata, name):
                 try:
-                    if int(idx) == int(req_idx):
-                        return str(rid)
+                    setattr(common_attn_metadata, name, x)
+                    return True
                 except Exception:
                     pass
+        return False
 
-        reqs = getattr(ib, "requests", None)
-        if isinstance(reqs, (list, tuple)) and 0 <= req_idx < len(reqs):
-            r = reqs[req_idx]
-            for name in ("request_id", "req_id", "id"):
-                v = getattr(r, name, None)
-                if v is not None:
-                    return str(v)
-
-        return f"row:{req_idx}"
-
-    def _active_rows_from_common_metadata(
-        self,
-        common_attn_metadata: Any,
-    ) -> list[tuple[int, int]]:
-        qsl = getattr(common_attn_metadata, "query_start_loc_cpu", None)
-        if qsl is None:
-            qsl = getattr(common_attn_metadata, "query_start_loc", None)
-
-        if qsl is None:
-            return []
-
-        if hasattr(qsl, "detach"):
-            xs = qsl.detach().cpu().numpy().astype(int).tolist()
-        else:
-            xs = [int(x) for x in qsl]
-
-        if len(xs) < 2:
-            return []
-
-        nreq = int(getattr(common_attn_metadata, "num_reqs", len(xs) - 1))
-        nreq = min(nreq, len(xs) - 1)
-
-        rows: list[tuple[int, int]] = []
-        for i in range(nreq):
-            n_sched = int(xs[i + 1] - xs[i])
-            if n_sched > 0:
-                rows.append((i, n_sched))
-        return rows
-
-    def _snapshot_source_descriptor(
-        self,
-        common_attn_metadata: Any,
-        req_idx: int,
-        req_key: str,
-        kv_cache_gid: int,
-    ) -> None:
-        bt = getattr(common_attn_metadata, "block_table_tensor", None)
-        if bt is None:
-            self._log("source_descriptor_snapshot_no_block_table", {
-                "req_idx": int(req_idx),
-                "req_key": req_key,
-                "kv_cache_gid": int(kv_cache_gid),
-            })
-            return
-
-        if req_idx < 0 or req_idx >= int(bt.shape[0]):
-            self._log("source_descriptor_snapshot_bad_req_idx", {
-                "req_idx": int(req_idx),
-                "req_key": req_key,
-                "kv_cache_gid": int(kv_cache_gid),
-                "shape": list(bt.shape),
-            })
-            return
-
-        n = min(int(bt.shape[1]), self.max_blocks)
-        if n <= 0:
-            return
-
-        snap = bt[req_idx, :n].detach().clone()
-        cpu = snap.detach().cpu().numpy().astype(int).tolist()
-
-        self.source_desc_gpu[kv_cache_gid] = snap
-        self.source_desc_cpu[kv_cache_gid] = cpu
-
-        self._log("source_descriptor_snapshot_ok", {
-            "req_idx": int(req_idx),
-            "req_key": req_key,
-            "kv_cache_gid": int(kv_cache_gid),
-            "num_blocks": int(n),
-            "source_descriptor_blocks": cpu[:32],
-        })
-
-    @torch.inference_mode()
-    def _tamper_victim_descriptor(
-        self,
-        common_attn_metadata: Any,
-        req_idx: int,
-        req_key: str,
-        kv_cache_gid: int,
-    ) -> None:
-        bt = getattr(common_attn_metadata, "block_table_tensor", None)
-        if bt is None:
-            self._log("skip_descriptor_no_block_table", {
-                "victim_req_idx": int(req_idx),
-                "victim_req_key": req_key,
-                "kv_cache_gid": int(kv_cache_gid),
-            })
-            return
-
-        src = self.source_desc_gpu.get(kv_cache_gid)
-        src_cpu = self.source_desc_cpu.get(kv_cache_gid, [])
-
-        if src is None:
-            self._log("skip_no_source_descriptor", {
-                "victim_req_idx": int(req_idx),
-                "victim_req_key": req_key,
-                "kv_cache_gid": int(kv_cache_gid),
-            })
-            return
-
-        if self.once and self.tamper_count > 0:
-            self._log("skip_once_already_tampered", {
-                "victim_req_idx": int(req_idx),
-                "victim_req_key": req_key,
-                "kv_cache_gid": int(kv_cache_gid),
-                "tamper_count": int(self.tamper_count),
-            })
-            return
-
-        if req_idx < 0 or req_idx >= int(bt.shape[0]):
-            self._log("skip_bad_victim_req_idx", {
-                "victim_req_idx": int(req_idx),
-                "victim_req_key": req_key,
-                "kv_cache_gid": int(kv_cache_gid),
-                "shape": list(bt.shape),
-            })
-            return
-
-        n = min(int(src.shape[0]), int(bt.shape[1]), self.max_blocks)
-        if n <= 0:
-            return
-
-        before = bt[req_idx, :n].detach().cpu().numpy().astype(int).tolist()
-        bt[req_idx, :n].copy_(src[:n].to(device=bt.device, dtype=bt.dtype))
-        after = bt[req_idx, :n].detach().cpu().numpy().astype(int).tolist()
-
-        self.tamper_count += 1
-
-        self._log("victim_descriptor_tamper_done", {
-            "victim_req_idx": int(req_idx),
-            "victim_req_key": req_key,
-            "source_req_key": self.source_key,
-            "kv_cache_gid": int(kv_cache_gid),
-            "num_blocks": int(n),
-            "descriptor_private_clone": True,
-            "victim_before": before[:32],
-            "victim_after": after[:32],
-            "source_descriptor_blocks": src_cpu[:32],
-            "tamper_count": int(self.tamper_count),
-        })
+    def _active_index(self, runner: Any, req_id: str) -> int | None:
+        ids = self._req_ids(runner)
+        try:
+            return ids.index(req_id)
+        except ValueError:
+            return None
 
     def after_common_metadata(
         self,
         runner: Any,
         common_attn_metadata: Any,
-        kv_cache_gid: int,
+        kv_cache_gid: int | None = None,
     ) -> None:
         if not self.enabled:
             return
 
         try:
-            rows = self._active_rows_from_common_metadata(common_attn_metadata)
-            if not rows:
-                self._log("skip_no_active_descriptor_rows", {
-                    "kv_cache_gid": int(kv_cache_gid),
-                    "num_active_rows": 0,
+            self._assign_roles(runner)
+
+            bt = self._metadata_bt_tensor(common_attn_metadata)
+            if bt is None:
+                write_event("desc_attack_skip_no_block_table_tensor", {
+                    "kv_cache_gid": kv_cache_gid,
+                    "metadata_type": type(common_attn_metadata).__name__,
+                })
+                return
+            if bt.ndim < 2:
+                write_event("desc_attack_skip_bad_shape", {
+                    "shape": tuple(bt.shape),
+                    "kv_cache_gid": kv_cache_gid,
                 })
                 return
 
-            for req_idx, n_sched in rows:
-                req_key = self._get_req_key(runner, req_idx)
+            try:
+                cloned = bt.clone()
+                self._set_metadata_bt_tensor(common_attn_metadata, cloned)
+                bt = cloned
+            except Exception:
+                pass
 
-                if req_key not in self.role_by_key and n_sched < self.min_prefill:
+            for req_id in self._req_ids(runner):
+                role = self._req_role.get(req_id, "other")
+                row_idx = self._active_index(runner, req_id)
+                if row_idx is None or row_idx >= int(bt.shape[0]):
                     continue
 
-                if req_key not in self.role_by_key:
-                    if self.source_key is None:
-                        self.source_key = req_key
-                        self.role_by_key[req_key] = "source"
-                        self._log("request_role_assigned", {
-                            "req_idx": int(req_idx),
-                            "req_key": req_key,
-                            "role": "source",
-                            "n_sched": int(n_sched),
-                        })
-                    elif self.victim_key is None and req_key != self.source_key:
-                        self.victim_key = req_key
-                        self.role_by_key[req_key] = "victim"
-                        self._log("request_role_assigned", {
-                            "req_idx": int(req_idx),
-                            "req_key": req_key,
-                            "role": "victim",
-                            "n_sched": int(n_sched),
-                        })
+                n_blocks = min(self.max_blocks, int(bt.shape[1]))
 
-                role = self.role_by_key.get(req_key)
-
-                if role == "source":
-                    self._snapshot_source_descriptor(
-                        common_attn_metadata=common_attn_metadata,
-                        req_idx=req_idx,
-                        req_key=req_key,
-                        kv_cache_gid=kv_cache_gid,
-                    )
+                if role == "source" and self._source_row is None:
+                    self._source_row = bt[row_idx, :n_blocks].detach().clone()
+                    valid = self._source_row[self._source_row >= 0]
+                    write_event("desc_source_snapshot_ok", {
+                        "req_id": req_id,
+                        "row_idx": row_idx,
+                        "kv_cache_gid": kv_cache_gid,
+                        "n_blocks": n_blocks,
+                        "valid_blocks": int(valid.numel()),
+                        "first_blocks": valid[:16].detach().cpu().tolist(),
+                    })
 
                 elif role == "victim":
-                    self._tamper_victim_descriptor(
-                        common_attn_metadata=common_attn_metadata,
-                        req_idx=req_idx,
-                        req_key=req_key,
-                        kv_cache_gid=kv_cache_gid,
+                    if self.attack_once and self._tampered_count > 0:
+                        continue
+                    if self._source_row is None:
+                        write_event("desc_victim_tamper_skip_no_source", {
+                            "req_id": req_id,
+                            "kv_cache_gid": kv_cache_gid,
+                        })
+                        continue
+
+                    n = min(n_blocks, int(self._source_row.numel()))
+                    old = bt[row_idx, :n].detach().clone()
+                    bt[row_idx, :n] = self._source_row[:n].to(
+                        device=bt.device,
+                        dtype=bt.dtype,
+                        non_blocking=True,
                     )
+                    self._tampered_count += 1
+
+                    write_event("desc_victim_tamper_done", {
+                        "req_id": req_id,
+                        "row_idx": row_idx,
+                        "kv_cache_gid": kv_cache_gid,
+                        "n_blocks": n,
+                        "old_first_blocks": old[old >= 0][:16].detach().cpu().tolist(),
+                        "new_first_blocks": bt[row_idx, :n][bt[row_idx, :n] >= 0][:16].detach().cpu().tolist(),
+                        "tampered_count": self._tampered_count,
+                    })
 
         except Exception as e:
-            self._log("descriptor_hook_error", {
+            write_event("desc_attack_error", {
                 "error": repr(e),
+                "kv_cache_gid": kv_cache_gid,
             })
+
+
+# Compatibility with older names.
+TZKVDescriptorAttackHook = TZKVDescriptorAttack

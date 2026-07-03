@@ -182,6 +182,11 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 logger = init_logger(__name__)
+# TZKV_ATTACK_IMPORTS_BEGIN
+from vllm.v1.worker.tzkv_block_table_attack import TZKVBlockTableAttack
+from vllm.v1.worker.tzkv_descriptor_attack import TZKVDescriptorAttack
+from vllm.v1.worker.tzkv_kv_payload_attack import TZKVKVPayloadAttack
+# TZKV_ATTACK_IMPORTS_END
 from vllm.v1.worker.tzkv_descriptor_attack import TZKVDescriptorAttackHook
 from vllm.v1.worker.tzkv_block_table_attack import TZKVBlockTableAttackHook
 from vllm.v1.worker.tzkv_kv_payload_min import TZKVKVPayloadMinHook
@@ -419,6 +424,11 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        # TZKV_ATTACK_INIT_BEGIN
+        self.tzkv_bt_attack_hook = TZKVBlockTableAttack()
+        self.tzkv_descriptor_attack_hook = TZKVDescriptorAttack()
+        self.tzkv_kv_payload_attack_hook = TZKVKVPayloadAttack()
+        # TZKV_ATTACK_INIT_END
         self.tzkv_descriptor_attack_hook = TZKVDescriptorAttackHook()
         self.tzkv_block_table_attack_hook = TZKVBlockTableAttackHook()
         self.tzkv_kv_payload_min_hook = TZKVKVPayloadMinHook()
@@ -437,6 +447,22 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        # TZKV_DESC_ATTACK_CALL_BEGIN
+        tzkv_desc_hook = getattr(self, "tzkv_descriptor_attack_hook", None)
+        if (tzkv_desc_hook is not None and
+                getattr(tzkv_desc_hook, "enabled", False) and
+                "cm" in locals()):
+            try:
+                if hasattr(cm, "block_table_tensor") and cm.block_table_tensor is not None:
+                    cm.block_table_tensor = cm.block_table_tensor.clone()
+                tzkv_desc_hook.after_common_metadata(
+                    runner=self,
+                    common_attn_metadata=cm,
+                    kv_cache_gid=locals().get("kv_cache_gid", None),
+                )
+            except Exception as e:
+                logger.exception("TZKV descriptor attack hook failed: %r", e)
+        # TZKV_DESC_ATTACK_CALL_END
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
                 NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
@@ -772,6 +798,19 @@ class GPUModelRunner(
         )
 
     def _init_model_kwargs(self):
+        # TZKV_BT_ATTACK_CALL_BEGIN
+        tzkv_bt_hook = getattr(self, "tzkv_bt_attack_hook", None)
+        if (tzkv_bt_hook is not None and
+                getattr(tzkv_bt_hook, "enabled", False) and
+                "scheduler_output" in locals()):
+            try:
+                tzkv_bt_hook.after_batch_update(
+                    runner=self,
+                    scheduler_output=scheduler_output,
+                )
+            except Exception as e:
+                logger.exception("TZKV BT attack hook failed: %r", e)
+        # TZKV_BT_ATTACK_CALL_END
         model_kwargs = dict[str, Any]()
 
         if not self.is_pooling_model:
@@ -3321,6 +3360,22 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            # TZKV_KV_ATTACK_CALL_BEGIN
+            tzkv_kv_hook = getattr(self, "tzkv_kv_payload_attack_hook", None)
+            if (tzkv_kv_hook is not None and
+                    getattr(tzkv_kv_hook, "enabled", False) and
+                    "scheduler_output" in locals() and
+                    "slot_mappings" in locals()):
+                try:
+                    tzkv_kv_hook.after_model_forward(
+                        runner=self,
+                        scheduler_output=scheduler_output,
+                        slot_mappings=slot_mappings,
+                        num_tokens=int(locals().get("num_tokens_unpadded", 0)),
+                    )
+                except Exception as e:
+                    logger.exception("TZKV KV payload attack hook failed: %r", e)
+            # TZKV_KV_ATTACK_CALL_END
             if getattr(self, "tzkv_kv_payload_min_hook", None) is not None:
                 self.tzkv_kv_payload_min_hook.after_forward(
                     runner=self,
