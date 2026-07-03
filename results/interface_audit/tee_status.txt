@@ -1,0 +1,62 @@
+ M pyproject.toml
+ M requirements/build.txt
+ M requirements/cpu-build.txt
+ M requirements/cpu.txt
+ M requirements/cuda.txt
+ M requirements/rocm-build.txt
+ M requirements/rocm-test.txt
+ M requirements/test.txt
+ M requirements/xpu.txt
+ M vllm/v1/worker/gpu_model_runner.py
+?? baseline_server.sh
+?? benchmark.sh
+?? optee_server.sh
+?? results/
+?? run_vllm.sh
+?? vllm/v1/worker/gpu_input_batch.py.before_bt_dirty_commit
+?? vllm/v1/worker/gpu_model_runner.py.before_bt_dirty_commit
+?? vllm/v1/worker/gpu_model_runner.py.before_bt_optee_guard
+?? vllm/v1/worker/gpu_model_runner.py.before_desc_optee_guard
+?? vllm/v1/worker/gpu_model_runner.py.before_desc_optee_guard_robust
+?? vllm/v1/worker/gpu_model_runner.py.before_kv_optee_guard
+?? vllm/v1/worker/gpu_model_runner.py.before_kv_optee_guard_repatch
+?? vllm/v1/worker/gpu_model_runner.py.before_kv_optee_guard_robust
+?? vllm/v1/worker/gpu_model_runner.py.before_meta_prepare
+?? vllm/v1/worker/gpu_model_runner.py.before_tzkv_attnmeta
+?? vllm/v1/worker/gpu_model_runner.py.before_tzkv_block_table
+?? vllm/v1/worker/gpu_model_runner.py.before_tzkv_descriptor
+?? vllm/v1/worker/gpu_model_runner.py.before_tzkv_kv_min
+?? vllm/v1/worker/gpu_model_runner.py.before_tzkv_v2_metadata
+?? vllm/v1/worker/gpu_model_runner.py.tzkv_kv_payload.bak
+?? vllm/v1/worker/tzkv_block_table_attack.py
+?? vllm/v1/worker/tzkv_block_table_attack.py.before_log_mode
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py.before_bt_dirty_commit
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py.before_fix_commit_indent
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py.before_log_mode
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py.before_remove_broken_semantic_transition
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py.before_repair_commit_clean_cm
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py.before_semantic_bt_patch
+?? vllm/v1/worker/tzkv_block_table_optee_guard.py.before_tzkv_v2_metadata
+?? vllm/v1/worker/tzkv_descriptor_attack.py
+?? vllm/v1/worker/tzkv_descriptor_attack.py.before_log_mode
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py.before_add_meta_prepare_wrapper
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py.before_block_size_fix
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py.before_disable_meta_prepare
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py.before_log_mode
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py.before_meta_prepare
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py.before_semantic_bt_patch
+?? vllm/v1/worker/tzkv_descriptor_optee_guard.py.before_timing_meta_prepare
+?? vllm/v1/worker/tzkv_kv_payload_min.py
+?? vllm/v1/worker/tzkv_kv_payload_min.py.before_attnmeta
+?? vllm/v1/worker/tzkv_kv_payload_min.py.before_log_mode
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py.before_bf16_hash_fix
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py.before_log_mode
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py.before_manifest_token_range_fix
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py.before_repair_hash_match
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py.before_slot_resolver_patch
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py.before_snapshot_error_log
+?? vllm/v1/worker/tzkv_kv_payload_optee_guard.py.before_tzkv_v2_metadata
+?? vllm/v1/worker/tzkv_log_utils.py

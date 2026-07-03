@@ -182,6 +182,9 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 logger = init_logger(__name__)
+from vllm.v1.worker.tzkv_descriptor_attack import TZKVDescriptorAttackHook
+from vllm.v1.worker.tzkv_block_table_attack import TZKVBlockTableAttackHook
+from vllm.v1.worker.tzkv_kv_payload_min import TZKVKVPayloadMinHook
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -416,6 +419,9 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.tzkv_descriptor_attack_hook = TZKVDescriptorAttackHook()
+        self.tzkv_block_table_attack_hook = TZKVBlockTableAttackHook()
+        self.tzkv_kv_payload_min_hook = TZKVKVPayloadMinHook()
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1459,6 +1465,14 @@ class GPUModelRunner(
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        if getattr(self, "tzkv_block_table_attack_hook", None) is not None:
+            self.tzkv_block_table_attack_hook.after_slot_mapping_commit(
+                runner=self,
+                scheduler_output=scheduler_output,
+                req_indices=req_indices,
+                positions=positions_np,
+                total_num_scheduled_tokens=total_num_scheduled_tokens,
+            )
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1763,7 +1777,19 @@ class GPUModelRunner(
                 cm.block_table_tensor, cm.slot_mapping = (
                     _get_block_table_and_slot_mapping(kv_cache_gid)
                 )
-
+            tzkv_desc_hook = getattr(self, "tzkv_descriptor_attack_hook", None)
+            if tzkv_desc_hook is not None and getattr(tzkv_desc_hook, "enabled", False):
+                try:
+                    # Descriptor-private copy. This avoids directly modifying
+                    # input_batch.block_table.gpu and makes this a descriptor attack.
+                    cm.block_table_tensor = cm.block_table_tensor.clone()
+                    tzkv_desc_hook.after_common_metadata(
+                        runner=self,
+                        common_attn_metadata=cm,
+                        kv_cache_gid=kv_cache_gid,
+                    )
+                except Exception as e:
+                    logger.exception("TZKV descriptor attack hook failed: %r", e)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -3295,6 +3321,14 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if getattr(self, "tzkv_kv_payload_min_hook", None) is not None:
+                self.tzkv_kv_payload_min_hook.after_forward(
+                    runner=self,
+                scheduler_output=scheduler_output,
+                    slot_mapping=getattr(self, "slot_mapping", None),
+                    num_tokens=int(num_tokens_unpadded),
+                    attn_metadata=attn_metadata,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

