@@ -4,6 +4,10 @@ SERVER_STDOUT=/home/xx/tee-llm-thor/logs/perf_baseline_vllmbench.server.out
 rm -rf "$TZKV_JSONL" "$SERVER_STDOUT"
 
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+export TZKV_LOG=/home/xx/tee-llm-thor/logs/clean_baseline.jsonl 
+export TZKV_BT_ATTACK_ENABLE=0
+export TZKV_DESC_ATTACK_ENABLE=0
+export TZKV_KV_ATTACK_ENABLE=0
 #TZKV_KV_PAYLOAD_MIN_ENABLE=0 \
 #TZKV_KV_OPTEE_ENABLE=0 \
 #TZKV_BLOCK_TABLE_ATTACK_ENABLE=0 \
