@@ -1689,6 +1689,21 @@ class GPUModelRunner(
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+
+        # TZKV OP-TEE BT defense begin
+        try:
+            from vllm.v1.worker.tzkv_optee_bt_guard import get_tzkv_optee_bt_guard
+            get_tzkv_optee_bt_guard().commit_and_verify(
+                runner=self,
+                block_table=block_table_gid_0,
+                phase="after_block_table_build_before_attention_use",
+                layer_id=0,
+            )
+        except Exception:
+            # In strict mode the guard raises RuntimeError and fail-stops the request.
+            # In non-strict mode the guard logs and returns.
+            raise
+        # TZKV OP-TEE BT defense end
         # TZKV: cache the real GPU slot mapping for KV payload attack hooks.
         # This is the per-token KV-cache slot vector used by attention metadata.
         self.tzkv_last_slot_mappings = slot_mapping_gid_0
