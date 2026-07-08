@@ -890,7 +890,20 @@ class GPUModelRunner(
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
+        # TZKV lifecycle: vLLM has reached the real request-finished point.
+        # Commit BT_FREE and KV revoke before dropping local request state.
+        if scheduler_output.finished_req_ids:
+            from vllm.v1.worker.tzkv_optee_bt_guard import get_tzkv_optee_bt_guard
+            tzkv_bt_guard = get_tzkv_optee_bt_guard()
+        else:
+            tzkv_bt_guard = None
+
         for req_id in scheduler_output.finished_req_ids:
+            if tzkv_bt_guard is not None:
+                tzkv_bt_guard.finish_request(
+                    str(req_id),
+                    phase="gpu_model_runner_update_states_finished",
+                )
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -1691,18 +1704,16 @@ class GPUModelRunner(
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
 
         # TZKV OP-TEE BT defense begin
-        try:
-            from vllm.v1.worker.tzkv_optee_bt_guard import get_tzkv_optee_bt_guard
-            get_tzkv_optee_bt_guard().commit_and_verify(
-                runner=self,
-                block_table=block_table_gid_0,
-                phase="after_block_table_build_before_attention_use",
-                layer_id=0,
-            )
-        except Exception:
-            # In strict mode the guard raises RuntimeError and fail-stops the request.
-            # In non-strict mode the guard logs and returns.
-            raise
+        from vllm.v1.worker.tzkv_optee_bt_guard import get_tzkv_optee_bt_guard
+
+        # In strict mode the guard raises RuntimeError and fail-stops the request.
+        # In non-strict mode the guard logs and returns.
+        get_tzkv_optee_bt_guard().commit_and_verify(
+            runner=self,
+            block_table=block_table_gid_0,
+            phase="after_block_table_build_before_attention_use",
+            layer_id=0,
+        )
         # TZKV OP-TEE BT defense end
         # TZKV: cache the real GPU slot mapping for KV payload attack hooks.
         # This is the per-token KV-cache slot vector used by attention metadata.
