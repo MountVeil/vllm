@@ -426,7 +426,6 @@ class GPUModelRunner(
         self.kv_caches: list[torch.Tensor] = []
         # TZKV_ATTACK_INIT_BEGIN
         self.tzkv_bt_attack_hook = TZKVBlockTableAttack()
-        self.tzkv_descriptor_attack_hook = TZKVDescriptorAttack()
         self.tzkv_kv_payload_attack_hook = TZKVKVPayloadAttack()
         # TZKV_ATTACK_INIT_END
         self.tzkv_descriptor_attack_hook = TZKVDescriptorAttackHook()
@@ -890,20 +889,7 @@ class GPUModelRunner(
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
-        # TZKV lifecycle: vLLM has reached the real request-finished point.
-        # Commit BT_FREE and KV revoke before dropping local request state.
-        if scheduler_output.finished_req_ids:
-            from vllm.v1.worker.tzkv_optee_bt_guard import get_tzkv_optee_bt_guard
-            tzkv_bt_guard = get_tzkv_optee_bt_guard()
-        else:
-            tzkv_bt_guard = None
-
         for req_id in scheduler_output.finished_req_ids:
-            if tzkv_bt_guard is not None:
-                tzkv_bt_guard.finish_request(
-                    str(req_id),
-                    phase="gpu_model_runner_update_states_finished",
-                )
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -1422,7 +1408,27 @@ class GPUModelRunner(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
+
+        # TZKV runtime hook: capture the final CPU-side block table before
+        # it is copied to GPU-visible memory.
+        from vllm.v1.worker.tzkv_runtime_hooks import get_tzkv_runtime_hooks
+
+        tzkv_hooks = get_tzkv_runtime_hooks()
+        tzkv_bt_approval = tzkv_hooks.on_block_table_ready(
+            runner=self,
+            scheduler_output=scheduler_output,
+            block_table=self.input_batch.block_table,
+            num_reqs=num_reqs,
+        )
+
         self.input_batch.block_table.commit_block_table(num_reqs)
+
+        tzkv_hooks.on_block_table_committed(
+            approval=tzkv_bt_approval,
+            runner=self,
+            block_table=self.input_batch.block_table,
+            num_reqs=num_reqs,
+        )
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1517,6 +1523,7 @@ class GPUModelRunner(
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+
         if getattr(self, "tzkv_block_table_attack_hook", None) is not None:
             self.tzkv_block_table_attack_hook.after_slot_mapping_commit(
                 runner=self,
@@ -1526,6 +1533,18 @@ class GPUModelRunner(
                 total_num_scheduled_tokens=total_num_scheduled_tokens,
             )
 
+        # TZKV runtime hook: slot mapping is now final on both CPU and GPU.
+        tzkv_slot_approval = tzkv_hooks.on_slot_mapping_ready(
+            block_table_approval=tzkv_bt_approval,
+            runner=self,
+            scheduler_output=scheduler_output,
+            block_table=self.input_batch.block_table,
+            req_indices=req_indices,
+            positions=positions_np,
+            num_tokens=total_num_scheduled_tokens,
+        )
+        self.tzkv_current_bt_approval = tzkv_bt_approval
+        self.tzkv_current_slot_approval = tzkv_slot_approval
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -1658,6 +1677,10 @@ class GPUModelRunner(
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
+        # TZKV fixed descriptor records. Each record contains only explicit
+        # CommonAttentionMetadata fields consumed by a backend metadata builder.
+        tzkv_descriptor_records: list[dict[str, Any]] = []
+
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
             # to make sure the backend see a max_seq_len that is larger to the sliding
@@ -1703,18 +1726,6 @@ class GPUModelRunner(
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
 
-        # TZKV OP-TEE BT defense begin
-        from vllm.v1.worker.tzkv_optee_bt_guard import get_tzkv_optee_bt_guard
-
-        # In strict mode the guard raises RuntimeError and fail-stops the request.
-        # In non-strict mode the guard logs and returns.
-        get_tzkv_optee_bt_guard().commit_and_verify(
-            runner=self,
-            block_table=block_table_gid_0,
-            phase="after_block_table_build_before_attention_use",
-            layer_id=0,
-        )
-        # TZKV OP-TEE BT defense end
         # TZKV: cache the real GPU slot mapping for KV payload attack hooks.
         # This is the per-token KV-cache slot vector used by attention metadata.
         self.tzkv_last_slot_mappings = slot_mapping_gid_0
@@ -1812,6 +1823,48 @@ class GPUModelRunner(
                     ],
                 )
 
+            # Capture only the fixed descriptor fields that vLLM explicitly
+            # provides to the selected attention metadata builder.
+            tzkv_descriptor_records.append(
+                {
+                    "kv_cache_group_id": int(kv_cache_gid),
+                    "attention_group_id": int(attn_gid),
+                    "ubatch_id": -1 if ubid is None else int(ubid),
+                    "num_reqs": int(common_attn_metadata.num_reqs),
+                    "num_actual_tokens": int(
+                        common_attn_metadata.num_actual_tokens
+                    ),
+                    "max_query_len": int(
+                        common_attn_metadata.max_query_len
+                    ),
+                    "max_seq_len": int(
+                        common_attn_metadata.max_seq_len
+                    ),
+                    "causal": bool(common_attn_metadata.causal),
+                    "block_table_tensor": (
+                        common_attn_metadata.block_table_tensor
+                    ),
+                    "slot_mapping": common_attn_metadata.slot_mapping,
+                    "query_start_loc": (
+                        common_attn_metadata.query_start_loc
+                    ),
+                    "seq_lens": common_attn_metadata.seq_lens,
+                    "num_computed_tokens": (
+                        common_attn_metadata._num_computed_tokens_cpu
+                    ),
+                    "encoder_seq_lens": getattr(
+                        common_attn_metadata,
+                        "encoder_seq_lens",
+                        None,
+                    ),
+                    "dcp_local_seq_lens": getattr(
+                        common_attn_metadata,
+                        "dcp_local_seq_lens",
+                        None,
+                    ),
+                }
+            )
+
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
@@ -1888,6 +1941,9 @@ class GPUModelRunner(
 
                 else:
                     _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
+
+        # Publish the exact fixed records generated for this metadata build.
+        self.tzkv_current_descriptor_records = tzkv_descriptor_records
 
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
@@ -3292,6 +3348,22 @@ class GPUModelRunner(
                 num_scheduled_tokens_np,
             )
 
+            # Retrieve the runtime-hook state produced by _prepare_inputs().
+            # These values cannot be accessed as _prepare_inputs local variables.
+            from vllm.v1.worker.tzkv_runtime_hooks import get_tzkv_runtime_hooks
+
+            tzkv_hooks = get_tzkv_runtime_hooks()
+            tzkv_bt_approval = getattr(
+                self,
+                "tzkv_current_bt_approval",
+                None,
+            )
+            tzkv_slot_approval = getattr(
+                self,
+                "tzkv_current_slot_approval",
+                None,
+            )
+
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
@@ -3364,6 +3436,19 @@ class GPUModelRunner(
                 )
             )
 
+            # TZKV runtime hook: attention metadata is fully constructed.
+            tzkv_descriptor_approval = tzkv_hooks.on_descriptor_ready(
+                block_table_approval=tzkv_bt_approval,
+                slot_mapping_approval=tzkv_slot_approval,
+                runner=self,
+                descriptor_records=self.tzkv_current_descriptor_records,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded,
+                cudagraph_mode=str(cudagraph_mode),
+            )
+
             (
                 input_ids,
                 inputs_embeds,
@@ -3385,6 +3470,19 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        tzkv_hooks.on_descriptor_use(
+            approval=tzkv_descriptor_approval,
+            block_table_approval=tzkv_bt_approval,
+            slot_mapping_approval=tzkv_slot_approval,
+            runner=self,
+            descriptor_records=self.tzkv_current_descriptor_records,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            cudagraph_mode=str(cudagraph_mode),
+        )
+
         with (
             set_forward_context(
                 attn_metadata,
