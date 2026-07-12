@@ -64,6 +64,51 @@ def _hash_array(value: np.ndarray) -> str:
     return h.hexdigest()
 
 
+_TZKV_DETAIL_PROFILE_ENABLED = _env_bool(
+    "TZKV_DETAIL_PROFILE_ENABLE",
+    False,
+)
+_TZKV_DETAIL_PROFILE_INTERVAL = int(
+    os.getenv("TZKV_DETAIL_PROFILE_INTERVAL", "256")
+)
+_TZKV_DETAIL_PROFILE_LOCK = threading.Lock()
+_TZKV_DETAIL_PROFILE_STATS: dict[str, list[int]] = {}
+
+
+def _detail_profile_add(
+    name: str,
+    elapsed_ns: int,
+) -> None:
+    if not _TZKV_DETAIL_PROFILE_ENABLED:
+        return
+
+    with _TZKV_DETAIL_PROFILE_LOCK:
+        stats = _TZKV_DETAIL_PROFILE_STATS.setdefault(
+            name,
+            [0, 0, 0],
+        )
+
+        # count, total_ns, max_ns
+        stats[0] += 1
+        stats[1] += elapsed_ns
+        stats[2] = max(stats[2], elapsed_ns)
+
+        count = stats[0]
+
+        if (
+            _TZKV_DETAIL_PROFILE_INTERVAL > 0
+            and count % _TZKV_DETAIL_PROFILE_INTERVAL == 0
+        ):
+            print(
+                "[TZKV-DETAIL]"
+                f" stage={name}"
+                f" count={count}"
+                f" mean_us={stats[1] / count / 1000.0:.3f}"
+                f" max_us={stats[2] / 1000.0:.3f}",
+                flush=True,
+            )
+
+
 def _optional_tensor_root(
     value: torch.Tensor | None,
     *,
@@ -144,6 +189,10 @@ class TZKVRuntimeHooks:
             "TZKV_HOOK_LOG_FULL_VALUES",
             False,
         )
+        self.log_enabled = _env_bool(
+            "TZKV_HOOK_LOG_ENABLE",
+            True,
+        )
         self.log_path = Path(
             os.getenv(
                 "TZKV_HOOK_LOG",
@@ -166,7 +215,7 @@ class TZKVRuntimeHooks:
             return batch_id
 
     def _event(self, event: str, **fields: Any) -> None:
-        if not self.enabled:
+        if not self.enabled or not self.log_enabled:
             return
 
         row = {
@@ -398,11 +447,18 @@ class TZKVRuntimeHooks:
             num_reqs,
         )
 
+        detail_start_ns = time.perf_counter_ns()
+
         roots, row_lengths, _ = (
             self._block_table_snapshot(
                 block_table,
                 num_reqs,
             )
+        )
+
+        _detail_profile_add(
+            "bt_commit.snapshot",
+            time.perf_counter_ns() - detail_start_ns,
         )
 
         if num_reqs != approval.num_reqs:
@@ -429,10 +485,54 @@ class TZKVRuntimeHooks:
 
         # Compare exactly the effective row ranges included
         # in the approved block-table digest.
+        detail_start_ns = time.perf_counter_ns()
+
         for group_id, table in enumerate(
             self._tables(block_table)
         ):
             lengths = approval.row_lengths[group_id]
+
+            if not lengths:
+                continue
+
+            max_effective_length = max(lengths)
+
+            # Perform one GPU-to-CPU transfer per KV-cache group instead
+            # of synchronizing separately for every effective row.
+            if max_effective_length > 0:
+                gpu_rows = _tensor_to_numpy(
+                    table.block_table.gpu[
+                        :len(lengths),
+                        :max_effective_length,
+                    ]
+                ).astype(
+                    np.int32,
+                    copy=False,
+                )
+                gpu_rows = np.ascontiguousarray(
+                    gpu_rows,
+                    dtype=np.int32,
+                )
+            else:
+                gpu_rows = np.empty(
+                    (len(lengths), 0),
+                    dtype=np.int32,
+                )
+
+            if gpu_rows.ndim != 2:
+                return self._fail(
+                    "GPU block-table snapshot is not two-dimensional",
+                    group_id=group_id,
+                    actual_shape=tuple(gpu_rows.shape),
+                )
+
+            if gpu_rows.shape[0] != len(lengths):
+                return self._fail(
+                    "GPU block-table snapshot row count changed",
+                    group_id=group_id,
+                    expected_rows=len(lengths),
+                    actual_rows=gpu_rows.shape[0],
+                )
 
             for row_idx, length in enumerate(lengths):
                 cpu_row = np.ascontiguousarray(
@@ -443,15 +543,10 @@ class TZKVRuntimeHooks:
                     dtype=np.int32,
                 )
 
-                gpu_row = _tensor_to_numpy(
-                    table.block_table.gpu[
-                        row_idx,
-                        :length,
-                    ]
-                ).astype(
-                    np.int32,
-                    copy=False,
-                )
+                gpu_row = gpu_rows[
+                    row_idx,
+                    :length,
+                ]
 
                 if (
                     cpu_row.shape != gpu_row.shape
@@ -468,7 +563,14 @@ class TZKVRuntimeHooks:
                         row_length=length,
                     )
 
+        _detail_profile_add(
+            "bt_commit.gpu_compare",
+            time.perf_counter_ns() - detail_start_ns,
+        )
+
         assert self.backend is not None
+
+        detail_start_ns = time.perf_counter_ns()
 
         try:
             self.backend.verify_block_table_commit(
@@ -485,6 +587,11 @@ class TZKVRuntimeHooks:
             return self._fail(
                 "backend rejected block-table commit",
                 error=str(exc),
+            )
+        finally:
+            _detail_profile_add(
+                "bt_commit.backend",
+                time.perf_counter_ns() - detail_start_ns,
             )
 
         self._event(
@@ -599,18 +706,22 @@ class TZKVRuntimeHooks:
 
         return approval
 
-    def _descriptor_record(
+    def _descriptor_group_snapshot(
         self,
         *,
-        record: dict[str, Any],
+        group_id: int,
         block_table_approval: BlockTableApproval,
         slot_mapping_approval: SlotMappingApproval,
         runner: Any,
     ) -> dict[str, Any]:
-        group_id = int(record["kv_cache_group_id"])
-        attn_group_id = int(record["attention_group_id"])
-        ubatch_id = int(record["ubatch_id"])
+        """
+        Capture the current GPU-visible BT and slot mapping once for
+        one KV-cache group.
 
+        A fresh cache is created by every _fixed_descriptor call, so
+        descriptor-ready and descriptor-use still perform independent
+        snapshots and checks.
+        """
         if group_id < 0:
             raise RuntimeError(
                 f"invalid kv_cache_group_id: {group_id}"
@@ -624,7 +735,219 @@ class TZKVRuntimeHooks:
                 f"KV-cache group {group_id}"
             )
 
-        block_table_tensor = record["block_table_tensor"]
+        tables = self._tables(
+            runner.input_batch.block_table
+        )
+
+        if group_id >= len(tables):
+            raise RuntimeError(
+                "descriptor KV-cache group exceeds "
+                f"runner table count: {group_id}"
+            )
+
+        table = tables[group_id]
+        row_lengths = (
+            block_table_approval.row_lengths[group_id]
+        )
+
+        max_effective_length = (
+            max(row_lengths)
+            if row_lengths
+            else 0
+        )
+
+        detail_start_ns = time.perf_counter_ns()
+
+        if max_effective_length > 0:
+            gpu_rows = _tensor_to_numpy(
+                table.block_table.gpu[
+                    :len(row_lengths),
+                    :max_effective_length,
+                ]
+            ).astype(
+                np.int32,
+                copy=False,
+            )
+
+            gpu_rows = np.ascontiguousarray(
+                gpu_rows,
+                dtype=np.int32,
+            )
+        else:
+            gpu_rows = np.empty(
+                (len(row_lengths), 0),
+                dtype=np.int32,
+            )
+
+        if gpu_rows.ndim != 2:
+            raise RuntimeError(
+                "GPU block-table snapshot is not "
+                "two-dimensional: "
+                f"group={group_id}, "
+                f"shape={tuple(gpu_rows.shape)}"
+            )
+
+        if gpu_rows.shape[0] != len(row_lengths):
+            raise RuntimeError(
+                "GPU block-table snapshot row count "
+                "changed: "
+                f"group={group_id}, "
+                f"expected={len(row_lengths)}, "
+                f"actual={gpu_rows.shape[0]}"
+            )
+
+        if (
+            max_effective_length > 0
+            and gpu_rows.shape[1]
+                < max_effective_length
+        ):
+            raise RuntimeError(
+                "GPU block-table snapshot column count "
+                "is too small: "
+                f"group={group_id}, "
+                f"expected={max_effective_length}, "
+                f"actual={gpu_rows.shape[1]}"
+            )
+
+        gpu_bt_hash = hashlib.sha256()
+        gpu_bt_hash.update(
+            b"TZKV.vllm.block_table.v1\0"
+        )
+        _encode_u64(
+            gpu_bt_hash,
+            BLOCK_TABLE_SCHEMA_VERSION,
+        )
+        _encode_u64(gpu_bt_hash, group_id)
+        _encode_u64(
+            gpu_bt_hash,
+            block_table_approval.num_reqs,
+        )
+
+        for row_idx, row_length in enumerate(
+            row_lengths
+        ):
+            gpu_row = np.ascontiguousarray(
+                gpu_rows[
+                    row_idx,
+                    :row_length,
+                ],
+                dtype=np.int32,
+            )
+
+            _encode_u64(gpu_bt_hash, row_idx)
+            _encode_u64(
+                gpu_bt_hash,
+                row_length,
+            )
+            gpu_bt_hash.update(
+                gpu_row.tobytes(order="C")
+            )
+
+        current_gpu_bt_root = (
+            gpu_bt_hash.hexdigest()
+        )
+        approved_gpu_bt_root = (
+            block_table_approval.group_roots[
+                group_id
+            ]
+        )
+
+        if (
+            current_gpu_bt_root
+            != approved_gpu_bt_root
+        ):
+            self._fail(
+                "GPU block table changed before "
+                "descriptor use",
+                kv_cache_group_id=group_id,
+                expected=approved_gpu_bt_root,
+                actual=current_gpu_bt_root,
+            )
+
+        _detail_profile_add(
+            "descriptor.gpu_bt_root",
+            time.perf_counter_ns()
+            - detail_start_ns,
+        )
+
+        detail_start_ns = time.perf_counter_ns()
+
+        num_effective_tokens = (
+            slot_mapping_approval.num_tokens
+        )
+
+        approved_slots = _tensor_to_numpy(
+            table.slot_mapping.gpu[
+                :num_effective_tokens
+            ]
+        ).astype(
+            np.int64,
+            copy=False,
+        )
+
+        approved_slots = np.ascontiguousarray(
+            approved_slots,
+            dtype=np.int64,
+        )
+
+        if approved_slots.ndim != 1:
+            raise RuntimeError(
+                "GPU slot-mapping snapshot is not "
+                "one-dimensional: "
+                f"group={group_id}, "
+                f"shape={tuple(approved_slots.shape)}"
+            )
+
+        if (
+            approved_slots.shape[0]
+            != num_effective_tokens
+        ):
+            raise RuntimeError(
+                "GPU slot-mapping length changed: "
+                f"group={group_id}, "
+                f"expected={num_effective_tokens}, "
+                f"actual={approved_slots.shape[0]}"
+            )
+
+        _detail_profile_add(
+            "descriptor.group_slot_snapshot",
+            time.perf_counter_ns()
+            - detail_start_ns,
+        )
+
+        return {
+            "table": table,
+            "row_lengths": row_lengths,
+            "max_effective_length": (
+                max_effective_length
+            ),
+            "gpu_rows": gpu_rows,
+            "approved_slots": approved_slots,
+        }
+
+    def _descriptor_record(
+        self,
+        *,
+        record: dict[str, Any],
+        block_table_approval: BlockTableApproval,
+        slot_mapping_approval: SlotMappingApproval,
+        runner: Any,
+        group_snapshots: dict[
+            int,
+            dict[str, Any],
+        ],
+    ) -> dict[str, Any]:
+        group_id = int(
+            record["kv_cache_group_id"]
+        )
+        attn_group_id = int(
+            record["attention_group_id"]
+        )
+        ubatch_id = int(record["ubatch_id"])
+
+        block_table_tensor = record[
+            "block_table_tensor"
+        ]
         slot_mapping = record["slot_mapping"]
 
         if not isinstance(
@@ -645,77 +968,110 @@ class TZKVRuntimeHooks:
                 "is not a torch.Tensor"
             )
 
-        table = self._tables(
-            runner.input_batch.block_table
-        )[group_id]
+        snapshot = group_snapshots.get(group_id)
 
-        row_lengths = (
-            block_table_approval.row_lengths[group_id]
-        )
+        if snapshot is None:
+            snapshot = (
+                self._descriptor_group_snapshot(
+                    group_id=group_id,
+                    block_table_approval=(
+                        block_table_approval
+                    ),
+                    slot_mapping_approval=(
+                        slot_mapping_approval
+                    ),
+                    runner=runner,
+                )
+            )
+            group_snapshots[group_id] = snapshot
 
-        # Final-use BT check: recompute the effective GPU block-table root
-        # and compare it with the root approved before the GPU copy.
-        gpu_bt_hash = hashlib.sha256()
-        gpu_bt_hash.update(b"TZKV.vllm.block_table.v1\0")
-        _encode_u64(gpu_bt_hash, BLOCK_TABLE_SCHEMA_VERSION)
-        _encode_u64(gpu_bt_hash, group_id)
-        _encode_u64(gpu_bt_hash, block_table_approval.num_reqs)
+        row_lengths = snapshot["row_lengths"]
+        max_effective_length = snapshot[
+            "max_effective_length"
+        ]
+        gpu_rows = snapshot["gpu_rows"]
 
-        for row_idx, row_length in enumerate(row_lengths):
-            gpu_row = _tensor_to_numpy(
-                table.block_table.gpu[
-                    row_idx,
-                    :row_length,
+        detail_start_ns = time.perf_counter_ns()
+
+        if max_effective_length > 0:
+            descriptor_rows = _tensor_to_numpy(
+                block_table_tensor[
+                    :len(row_lengths),
+                    :max_effective_length,
                 ]
             ).astype(
                 np.int32,
                 copy=False,
             )
-            gpu_row = np.ascontiguousarray(
-                gpu_row,
+
+            descriptor_rows = np.ascontiguousarray(
+                descriptor_rows,
+                dtype=np.int32,
+            )
+        else:
+            descriptor_rows = np.empty(
+                (len(row_lengths), 0),
                 dtype=np.int32,
             )
 
-            _encode_u64(gpu_bt_hash, row_idx)
-            _encode_u64(gpu_bt_hash, row_length)
-            gpu_bt_hash.update(gpu_row.tobytes(order="C"))
-
-        current_gpu_bt_root = gpu_bt_hash.hexdigest()
-        approved_gpu_bt_root = (
-            block_table_approval.group_roots[group_id]
-        )
-
-        if current_gpu_bt_root != approved_gpu_bt_root:
-            self._fail(
-                "GPU block table changed before descriptor use",
+        if descriptor_rows.ndim != 2:
+            return self._fail(
+                "descriptor block table is not "
+                "two-dimensional",
                 kv_cache_group_id=group_id,
                 attention_group_id=attn_group_id,
                 ubatch_id=ubatch_id,
-                expected=approved_gpu_bt_root,
-                actual=current_gpu_bt_root,
+                actual_shape=tuple(
+                    descriptor_rows.shape
+                ),
             )
 
-        # Verify each descriptor row against the now-validated GPU BT.
-        for row_idx, row_length in enumerate(row_lengths):
-            descriptor_row = _tensor_to_numpy(
-                block_table_tensor[
-                    row_idx,
-                    :row_length,
-                ]
-            ).astype(
-                np.int32,
-                copy=False,
+        if (
+            descriptor_rows.shape[0]
+            != len(row_lengths)
+        ):
+            return self._fail(
+                "descriptor block-table row count "
+                "changed",
+                kv_cache_group_id=group_id,
+                attention_group_id=attn_group_id,
+                ubatch_id=ubatch_id,
+                expected_rows=len(row_lengths),
+                actual_rows=(
+                    descriptor_rows.shape[0]
+                ),
             )
 
-            approved_row = _tensor_to_numpy(
-                table.block_table.gpu[
-                    row_idx,
-                    :row_length,
-                ]
-            ).astype(
-                np.int32,
-                copy=False,
+        if (
+            max_effective_length > 0
+            and descriptor_rows.shape[1]
+                < max_effective_length
+        ):
+            return self._fail(
+                "descriptor block-table column "
+                "count is too small",
+                kv_cache_group_id=group_id,
+                attention_group_id=attn_group_id,
+                ubatch_id=ubatch_id,
+                expected_columns=(
+                    max_effective_length
+                ),
+                actual_columns=(
+                    descriptor_rows.shape[1]
+                ),
             )
+
+        for row_idx, row_length in enumerate(
+            row_lengths
+        ):
+            descriptor_row = descriptor_rows[
+                row_idx,
+                :row_length,
+            ]
+            approved_row = gpu_rows[
+                row_idx,
+                :row_length,
+            ]
 
             if not np.array_equal(
                 descriptor_row,
@@ -725,15 +1081,25 @@ class TZKVRuntimeHooks:
                     "descriptor block table differs "
                     "from approved block table",
                     kv_cache_group_id=group_id,
-                    attention_group_id=attn_group_id,
+                    attention_group_id=(
+                        attn_group_id
+                    ),
                     ubatch_id=ubatch_id,
                     row_idx=row_idx,
                     row_length=row_length,
                 )
 
+        _detail_profile_add(
+            "descriptor.bt_binding",
+            time.perf_counter_ns()
+            - detail_start_ns,
+        )
+
         num_effective_tokens = (
             slot_mapping_approval.num_tokens
         )
+
+        detail_start_ns = time.perf_counter_ns()
 
         descriptor_slots = _tensor_to_numpy(
             slot_mapping[:num_effective_tokens]
@@ -742,14 +1108,14 @@ class TZKVRuntimeHooks:
             copy=False,
         )
 
-        approved_slots = _tensor_to_numpy(
-            table.slot_mapping.gpu[
-                :num_effective_tokens
-            ]
-        ).astype(
-            np.int64,
-            copy=False,
+        descriptor_slots = np.ascontiguousarray(
+            descriptor_slots,
+            dtype=np.int64,
         )
+
+        approved_slots = snapshot[
+            "approved_slots"
+        ]
 
         if not np.array_equal(
             descriptor_slots,
@@ -763,7 +1129,17 @@ class TZKVRuntimeHooks:
                 ubatch_id=ubatch_id,
             )
 
-        query_start_loc = record["query_start_loc"]
+        _detail_profile_add(
+            "descriptor.slot_binding",
+            time.perf_counter_ns()
+            - detail_start_ns,
+        )
+
+        detail_start_ns = time.perf_counter_ns()
+
+        query_start_loc = record[
+            "query_start_loc"
+        ]
         seq_lens = record["seq_lens"]
         num_computed_tokens = record[
             "num_computed_tokens"
@@ -771,16 +1147,22 @@ class TZKVRuntimeHooks:
 
         fixed = {
             "kv_cache_group_id": group_id,
-            "attention_group_id": attn_group_id,
+            "attention_group_id": (
+                attn_group_id
+            ),
             "ubatch_id": ubatch_id,
-            "num_reqs": int(record["num_reqs"]),
+            "num_reqs": int(
+                record["num_reqs"]
+            ),
             "num_actual_tokens": int(
                 record["num_actual_tokens"]
             ),
             "max_query_len": int(
                 record["max_query_len"]
             ),
-            "max_seq_len": int(record["max_seq_len"]),
+            "max_seq_len": int(
+                record["max_seq_len"]
+            ),
             "causal": bool(record["causal"]),
             "block_table_root": (
                 block_table_approval.group_roots[
@@ -788,17 +1170,18 @@ class TZKVRuntimeHooks:
                 ]
             ),
             "slot_mapping_root": (
-                slot_mapping_approval.slot_mapping_roots[
-                    group_id
-                ]
+                slot_mapping_approval
+                .slot_mapping_roots[group_id]
             ),
             "query_start_loc_root": (
                 _optional_tensor_root(
                     query_start_loc,
                 )
             ),
-            "seq_lens_root": _optional_tensor_root(
-                seq_lens,
+            "seq_lens_root": (
+                _optional_tensor_root(
+                    seq_lens,
+                )
             ),
             "num_computed_tokens_root": (
                 _optional_tensor_root(
@@ -807,15 +1190,25 @@ class TZKVRuntimeHooks:
             ),
             "encoder_seq_lens_root": (
                 _optional_tensor_root(
-                    record.get("encoder_seq_lens")
+                    record.get(
+                        "encoder_seq_lens"
+                    )
                 )
             ),
             "dcp_local_seq_lens_root": (
                 _optional_tensor_root(
-                    record.get("dcp_local_seq_lens")
+                    record.get(
+                        "dcp_local_seq_lens"
+                    )
                 )
             ),
         }
+
+        _detail_profile_add(
+            "descriptor.fixed_roots",
+            time.perf_counter_ns()
+            - detail_start_ns,
+        )
 
         return fixed
 
@@ -942,6 +1335,14 @@ class TZKVRuntimeHooks:
                 "batch IDs differ"
             )
 
+        # Each invocation gets a fresh snapshot cache.
+        # This avoids repeated copies within one ready/use pass while
+        # preserving independent snapshots across both checkpoints.
+        group_snapshots: dict[
+            int,
+            dict[str, Any],
+        ] = {}
+
         fixed_records = [
             self._descriptor_record(
                 record=record,
@@ -952,6 +1353,7 @@ class TZKVRuntimeHooks:
                     slot_mapping_approval
                 ),
                 runner=runner,
+                group_snapshots=group_snapshots,
             )
             for record in descriptor_records
         ]
@@ -1021,6 +1423,8 @@ class TZKVRuntimeHooks:
 
         assert self.backend is not None
 
+        detail_start_ns = time.perf_counter_ns()
+
         try:
             (
                 backend_approval,
@@ -1042,6 +1446,11 @@ class TZKVRuntimeHooks:
                 error=str(exc),
             )
             return None
+        finally:
+            _detail_profile_add(
+                "descriptor_ready.backend",
+                time.perf_counter_ns() - detail_start_ns,
+            )
 
         approval = DescriptorApproval(
             schema_version=DESCRIPTOR_SCHEMA_VERSION,
@@ -1159,6 +1568,8 @@ class TZKVRuntimeHooks:
 
         assert self.backend is not None
 
+        detail_start_ns = time.perf_counter_ns()
+
         try:
             self.backend.verify_descriptor_use(
                 approval.use_ticket,
@@ -1182,6 +1593,11 @@ class TZKVRuntimeHooks:
             return self._fail(
                 "backend rejected descriptor final use",
                 error=str(exc),
+            )
+        finally:
+            _detail_profile_add(
+                "descriptor_use.backend",
+                time.perf_counter_ns() - detail_start_ns,
             )
 
         self._event(
@@ -1207,3 +1623,88 @@ def get_tzkv_runtime_hooks() -> TZKVRuntimeHooks:
         _HOOKS = TZKVRuntimeHooks()
 
     return _HOOKS
+
+
+# ---------------------------------------------------------------------------
+# Optional low-overhead TZKV stage profiler.
+# Enabled with TZKV_PROFILE_ENABLE=1.
+# Prints cumulative statistics every TZKV_PROFILE_INTERVAL calls.
+# ---------------------------------------------------------------------------
+
+_TZKV_PROFILE_ENABLED = _env_bool(
+    "TZKV_PROFILE_ENABLE",
+    False,
+)
+_TZKV_PROFILE_INTERVAL = int(
+    os.getenv("TZKV_PROFILE_INTERVAL", "256")
+)
+_TZKV_PROFILE_LOCK = threading.Lock()
+_TZKV_PROFILE_STATS: dict[str, list[int]] = {}
+
+
+def _tzkv_profile_wrap(name: str, method: Any) -> Any:
+    if getattr(method, "_tzkv_profile_wrapped", False):
+        return method
+
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        start_ns = time.perf_counter_ns()
+
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            elapsed_ns = time.perf_counter_ns() - start_ns
+
+            with _TZKV_PROFILE_LOCK:
+                stats = _TZKV_PROFILE_STATS.setdefault(
+                    name,
+                    [0, 0, 0],
+                )
+
+                # count, total_ns, max_ns
+                stats[0] += 1
+                stats[1] += elapsed_ns
+                stats[2] = max(stats[2], elapsed_ns)
+
+                count = stats[0]
+
+                if (
+                    _TZKV_PROFILE_INTERVAL > 0
+                    and count % _TZKV_PROFILE_INTERVAL == 0
+                ):
+                    mean_us = stats[1] / count / 1000.0
+                    max_us = stats[2] / 1000.0
+
+                    print(
+                        "[TZKV-PROFILE]"
+                        f" stage={name}"
+                        f" count={count}"
+                        f" mean_us={mean_us:.3f}"
+                        f" max_us={max_us:.3f}",
+                        flush=True,
+                    )
+
+    wrapped._tzkv_profile_wrapped = True
+    return wrapped
+
+
+if _TZKV_PROFILE_ENABLED:
+    for _method_name in (
+        "on_block_table_ready",
+        "on_block_table_committed",
+        "on_slot_mapping_ready",
+        "on_descriptor_ready",
+        "on_descriptor_use",
+    ):
+        _original_method = getattr(
+            TZKVRuntimeHooks,
+            _method_name,
+        )
+
+        setattr(
+            TZKVRuntimeHooks,
+            _method_name,
+            _tzkv_profile_wrap(
+                _method_name,
+                _original_method,
+            ),
+        )
